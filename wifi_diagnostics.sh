@@ -40,19 +40,33 @@ fi
 while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
 SUDO_KEEPALIVE_PID=$!
 
-# ---- Detect WiFi interface ---------------------------------
+# ---- Detect WiFi interface and service name ----------------
+# $WIFI_IF      = device name (e.g. en0)     — used by ifconfig, airport, ipconfig etc.
+# $WIFI_SERVICE = service name (e.g. "Wi-Fi") — required by networksetup proxy/DNS commands
 WIFI_IF=$(networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi/{found=1} found && /Device:/{print $2; exit}')
+WIFI_SERVICE=$(networksetup -listallnetworkservices 2>/dev/null | grep -iE "^wi-fi$|^airport$|^wireless lan$" | head -1)
+[ -z "$WIFI_SERVICE" ] && WIFI_SERVICE="Wi-Fi"
+[ -z "$WIFI_IF"      ] && WIFI_IF="en0"
 
-if [ -z "$WIFI_IF" ]; then
+if ! networksetup -listallhardwareports 2>/dev/null | grep -q "Device: $WIFI_IF"; then
     echo -e "${RED}WARNING: No Wi-Fi interface detected. Some commands will be skipped.${RESET}"
-    WIFI_IF="en0"  # fallback default
 else
-    echo -e "${GREEN}Detected WiFi interface: ${BOLD}$WIFI_IF${RESET}"
+    echo -e "${GREEN}Detected WiFi interface : ${BOLD}$WIFI_IF${RESET}"
+    echo -e "${GREEN}Detected WiFi service   : ${BOLD}$WIFI_SERVICE${RESET}"
 fi
 echo ""
 
-# ---- airport utility path ----------------------------------
-AIRPORT="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+# ---- airport utility path (try multiple known locations) ---
+AIRPORT=""
+for AP_PATH in \
+    "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport" \
+    "/usr/local/bin/airport" \
+    "/usr/bin/airport"; do
+    if [ -f "$AP_PATH" ]; then
+        AIRPORT="$AP_PATH"
+        break
+    fi
+done
 
 # ---- Output paths ------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,11 +77,14 @@ ZIP_FILE="$SCRIPT_DIR/WiFi_Report_$TIMESTAMP.zip"
 # ---- File header -------------------------------------------
 cat > "$OUTPUT_TXT" <<EOF
 macOS WiFi Diagnostics Tool Report
+by Manish Sharma
+============================================
 Generated : $(date '+%Y-%m-%d %H:%M:%S')
 User      : $(whoami)
 Hostname  : $(hostname)
 macOS     : $(sw_vers -productName) $(sw_vers -productVersion) ($(sw_vers -buildVersion))
 WiFi IF   : $WIFI_IF
+WiFi Svc  : $WIFI_SERVICE
 ============================================
 
 EOF
@@ -123,8 +140,8 @@ run_and_log "Ping 8.8.8.8 (4 packets)"                 "ping -c 4 8.8.8.8"
 run_and_log "Traceroute to 8.8.8.8"                    "traceroute -n -m 30 -w 2 8.8.8.8"
 run_and_log "DNS Lookup (google.com) - nslookup"        "nslookup google.com"
 run_and_log "DNS Lookup (google.com) - dig"             "dig google.com"
-run_and_log "DNS Servers ($WIFI_IF)"                    "networksetup -getdnsservers $WIFI_IF"
-run_and_log "Search Domains ($WIFI_IF)"                 "networksetup -getsearchdomains $WIFI_IF"
+run_and_log "DNS Servers ($WIFI_SERVICE)"                "networksetup -getdnsservers \"$WIFI_SERVICE\""
+run_and_log "Search Domains ($WIFI_SERVICE)"            "networksetup -getsearchdomains \"$WIFI_SERVICE\""
 
 # ============================================================
 # SECTION 3 — MTU Tests
@@ -140,11 +157,11 @@ run_and_log "MTU Test - 1500 bytes (expect failure if MTU=1500)"  "ping -c 4 -D 
 # ============================================================
 # SECTION 4 — Proxy Settings
 # ============================================================
-run_and_log "Web Proxy (HTTP)"                          "networksetup -getwebproxy $WIFI_IF"
-run_and_log "Secure Web Proxy (HTTPS)"                  "networksetup -getsecurewebproxy $WIFI_IF"
-run_and_log "SOCKS Proxy"                               "networksetup -getsocksfirewallproxy $WIFI_IF"
-run_and_log "Auto-Proxy (PAC)"                          "networksetup -getautoproxyurl $WIFI_IF"
-run_and_log "Proxy Bypass Domains"                      "networksetup -getproxybypassdomains $WIFI_IF"
+run_and_log "Web Proxy (HTTP)"                          "networksetup -getwebproxy \"$WIFI_SERVICE\""
+run_and_log "Secure Web Proxy (HTTPS)"                  "networksetup -getsecurewebproxy \"$WIFI_SERVICE\""
+run_and_log "SOCKS Proxy"                               "networksetup -getsocksfirewallproxy \"$WIFI_SERVICE\""
+run_and_log "Auto-Proxy (PAC)"                          "networksetup -getautoproxyurl \"$WIFI_SERVICE\""
+run_and_log "Proxy Bypass Domains"                      "networksetup -getproxybypassdomains \"$WIFI_SERVICE\""
 
 # ============================================================
 # SECTION 5 — WiFi Adapter & Hardware Details
@@ -157,15 +174,21 @@ run_and_log "WiFi Power Status"                                "networksetup -ge
 # ============================================================
 # SECTION 6 — Current WiFi Connection
 # ============================================================
-if [ -f "$AIRPORT" ]; then
+if [ -n "$AIRPORT" ]; then
     run_and_log "Current WiFi Connection Details (airport)"    "$AIRPORT -I"
     run_and_log "Scan Visible Networks (airport)"              "$AIRPORT -s" "true"
 else
-    echo -e "${YELLOW}airport utility not found — skipping airport commands${RESET}"
-    echo "airport utility not found — skipping airport commands" >> "$OUTPUT_TXT"
+    echo -e "${YELLOW}airport utility not found (removed in newer macOS) — using wdutil fallback${RESET}"
+    echo "airport utility not found — attempting wdutil fallback" >> "$OUTPUT_TXT"
+    # wdutil is available on macOS 12+ as a partial alternative
+    if command -v wdutil &>/dev/null; then
+        run_and_log "WiFi Info (wdutil - airport fallback)"    "wdutil info" "true"
+    else
+        echo "wdutil also unavailable. WiFi scan data not collected." >> "$OUTPUT_TXT"
+    fi
 fi
 
-run_and_log "WiFi Network Name (SSID)"                         "networksetup -getairportnetwork $WIFI_IF"
+run_and_log "WiFi Network Name (SSID)"                     "networksetup -getairportnetwork $WIFI_IF"
 
 # ============================================================
 # SECTION 7 — Saved WiFi Profiles
@@ -195,7 +218,7 @@ run_and_log "Firewall Stealth Mode"                            "/usr/libexec/App
 # SECTION 11 — System Logs (WiFi related, last 100 lines)
 # ============================================================
 run_and_log "Recent WiFi System Log Entries"  \
-    "log show --predicate 'subsystem == \"com.apple.wifi\"' --last 1h --info 2>/dev/null | tail -100 || echo 'log command unavailable'" \
+    "log show --predicate 'subsystem == \"com.apple.wifi\" OR subsystem == \"com.apple.network.wifi\" OR subsystem BEGINSWITH \"com.apple.airportd\" OR process == \"airportd\"' --last 2h --info 2>/dev/null | tail -150 || echo 'WiFi log entries unavailable on this macOS version'" \
     "true"
 
 # ============================================================
